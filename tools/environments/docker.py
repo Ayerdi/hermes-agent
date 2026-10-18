@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Optional
 
 from hermes_constants import get_hermes_home
-from tools.environments.base import BaseEnvironment, EnvironmentConnectionError, _SHELL_ENV_NAME_RE
+from tools.environments.base import BaseEnvironment, EnvironmentConnectionError, _SHELL_ENV_NAME_RE, get_sandbox_dir
 from tools.terminal_tool_config import (
     _host_path_key, _is_windows_drive_path, cwd_follows_host_mount,
 )
@@ -34,7 +34,7 @@ from tools.environments.docker_egress import (
     check_forward_env_collisions, merge_egress_env,
 )
 from tools.environments.docker_ownership import (
-    hand_back_sandbox_files, reclaim_sandbox_files, strip_sandbox_privileges)
+    SANDBOX_LABEL, hand_back_sandbox_files, reclaim_sandbox_files, strip_sandbox_privileges)
 from tools.environments.path_utils import sanitize_task_id_for_path
 from tools.environments.remote_common import (
     bash_argv, client_env_with, load_hermes_env_vars, prepend_unset, resolve_passthrough_env, run_capture)
@@ -206,7 +206,7 @@ def reap_orphan_containers(
         age = (now - finished_at).total_seconds()
         if age < max_age_seconds:
             continue
-        strip_sandbox_privileges(docker, cid, None)  # its teardown never ran; owners stay (it may restart)
+        strip_sandbox_privileges(docker, cid)  # its teardown never ran; owners stay (it may restart)
         # No -f: a sibling may have restarted the container between the ps snapshot
         # and now (FinishedAt still reports the previous exit), and the daemon refuses
         # a plain rm on a running container, which is the atomic recheck this sweep needs.
@@ -738,6 +738,8 @@ class DockerEnvironment(BaseEnvironment):
             "hermes-task-id": task_label,
             "hermes-profile": profile_name,
             _EGRESS_LABEL_KEY: egress_label}
+        if self._sandbox_mounts:  # lets a profile sharing this container find its sandbox dirs
+            self._labels[SANDBOX_LABEL] = str(get_sandbox_dir() / "docker")
         # Explicit sharing opts into the first creator's settings. Otherwise,
         # changed image/mount/home configuration must start a fresh container.
         if not shared_container_key:
@@ -754,8 +756,8 @@ class DockerEnvironment(BaseEnvironment):
             task_label, profile_name, egress_label, network)
         if not reused:
             self._container_id = self._docker_run(cwd)
-        elif self._sandbox_mounts:  # it never stopped, so no teardown stripped what it left
-            strip_sandbox_privileges(self._docker_exe, self._container_id, self._sandbox_mounts)
+        else:  # it never stopped, so no teardown stripped what it left
+            strip_sandbox_privileges(self._docker_exe, self._container_id)
         reclaim_sandbox_files(self._docker_exe, self._container_id, self._sandbox_mounts)
 
         # Init-time env forwarding args seed the snapshot.
@@ -882,7 +884,6 @@ class DockerEnvironment(BaseEnvironment):
 
         writable_args: list[str] = []
         if self._persistent:
-            from tools.environments.base import get_sandbox_dir
             # _sandbox_dir_name(): a raw session-key task_id carries colons,
             # which `-v` reads as extra spec fields (exit 125).
             sandbox = get_sandbox_dir() / "docker" / _sandbox_dir_name(task_id)
@@ -1291,8 +1292,8 @@ class DockerEnvironment(BaseEnvironment):
             # Drop the in-process handle so a fresh __init__ re-probes via
             # labels instead of reusing a stale Python reference.
             self._container_id = None
-            if sandbox_mounts:  # the host user may run what the container left before it is reattached
-                self._start_teardown(lambda: strip_sandbox_privileges(docker_exe, container_id, sandbox_mounts), log_id)
+            # The host user may run what the container left before it is reattached.
+            self._start_teardown(lambda: strip_sandbox_privileges(docker_exe, container_id), log_id)
             return
 
         def _do_cleanup() -> None:
