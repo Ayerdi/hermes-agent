@@ -34,14 +34,16 @@ def _fake_docker(monkeypatch, security_options: str, fail: str = ""):
         calls.append((argv, kwargs.get("input") or b""))
         sub = argv[1] if len(argv) > 1 else ""
         rc = 0
-        if "/bin/chown" in argv and fail == "chown-timeout":
+        if "/usr/bin/xargs" in argv and fail == "chown-timeout":
             raise subprocess.TimeoutExpired(argv, 10)
-        if "/bin/chown" in argv and fail == "chown":
+        if "/usr/bin/xargs" in argv and fail == "chown":
             rc = 1  # e.g. a container without CAP_CHOWN
         out = {"run": "fake-cid\n", "info": security_options}.get(sub, "")
         if sub == "inspect" and argv[-1] == "fake-cid":
             out = _inspect() if len(argv) == 3 else json.dumps(json.loads(_inspect())[0]["Mounts"])
-        if "/usr/bin/find" in argv and "-user" in argv:
+        if "/bin/stat" in argv:  # owners of the setuid/setgid files a strip walk selects
+            out = "0\n1000\n"
+        elif "/usr/bin/find" in argv and "-user" in argv and "-print0" in argv:
             out = (_ROOT_OWNED if argv[argv.index("-user") + 1] == "0" else _HOST_OWNED).decode()
             rc = 1 if fail == "find" else 0  # e.g. find missing from the image
         if kwargs.get("text") or kwargs.get("encoding"):
@@ -77,6 +79,8 @@ def _to_root(calls):
     (False, _EXTRA_USER, _PLAIN, "reclaim"),
     (False, [], _PLAIN, "reclaim-fails-find"),  # a failed reclaim keeps the record; a retry succeeds
     (False, [], _PLAIN, "reclaim-fails-chown"),
+    (False, [], _PLAIN, "persist"),  # never removed: stripped on detach and reattach, owners unchanged
+    (True, [], _PLAIN, "persist-none"),
 ])
 def test_root_container_teardown_hands_every_sandbox_mount_back_before_removal(
         monkeypatch, tmp_path, run_as_host_user, user_args, security_options, scenario):
@@ -94,7 +98,7 @@ def test_root_container_teardown_hands_every_sandbox_mount_back_before_removal(
     def _env():
         return docker_env.DockerEnvironment(
             image="python:3.12-slim", cwd="/root", timeout=5, task_id="chown-back", persistent_filesystem=True,
-            persist_across_processes=False, run_as_host_user=run_as_host_user,
+            persist_across_processes=scenario.startswith("persist"), run_as_host_user=run_as_host_user,
             volumes=[f"{nested_ro}:/root/.hermes/skills:ro"],
             extra_args=["-v", f"{shared}:/workspace/shared", *user_args])
     env = _env()
@@ -112,9 +116,20 @@ def test_root_container_teardown_hands_every_sandbox_mount_back_before_removal(
         return
     env.cleanup()
     assert env.wait_for_cleanup(5)
+    if scenario.startswith("persist"):  # a running container: strip bits/caps in place, give nothing away
+        monkeypatch.setattr(docker_env.DockerEnvironment, "_find_reusable_container", lambda *a: ("fake-cid", "running"))
+        reattached = _env()  # held: a collected env detaches (and strips) again
+        strips = [argv for argv, _ in calls if "/bin/chown" in argv and "/usr/bin/find" in argv]
+        assert "stop" not in [argv[1] for argv, _ in calls] and not record.exists(), calls
+        assert len(strips) == (0 if scenario == "persist-none" else 4), calls  # owners 0 and 1000, detach + attach
+        for argv in strips:  # only the sandbox dirs are mounted: a swap mid-walk cannot reach host data
+            assert "--volumes-from" not in argv and "--cap-drop" in argv and "-perm" in argv, argv
+            assert argv[argv.index("-user") + 1] == argv[argv.index("--") + 1], argv  # re-chowned to its own uid
+        assert reattached._container_id == "fake-cid"
+        return
 
     subcommands = [argv[1] for argv, _ in calls]
-    chowns = [(argv, stdin) for argv, stdin in calls if "/bin/chown" in argv]
+    chowns = [(argv, stdin) for argv, stdin in calls if "/usr/bin/xargs" in argv]
     if scenario == "none":
         assert chowns == [], chowns
         assert subcommands[-1] == "rm" and "stop" in subcommands
@@ -125,7 +140,12 @@ def test_root_container_teardown_hands_every_sandbox_mount_back_before_removal(
         assert name.startswith("hermes-handback-fake-cid-") and [docker_env.find_docker(), "rm", "-f", name] in [
             argv for argv, _ in calls], calls
         return
-    (walk,) = [argv for argv, _ in calls if "/usr/bin/find" in argv]
+    # Setuid/setgid files of every owner (a host-owned group-root setgid file too) lose the bits first.
+    strips = [argv for argv, _ in calls if "/usr/bin/find" in argv and "/usr/bin/xargs" not in argv
+              and "-print0" not in argv]
+    assert [s[s.index("-user") + 1] for s in strips if "-user" in s] == ["0", "1000"], strips
+    assert all(s[s.index("-xdev") + 1:].count("-perm") == 1 for s in strips), strips
+    (walk,) = [argv for argv, _ in calls if "/usr/bin/find" in argv and "-print0" in argv]
     ((chown, stdin),) = chowns
     # After stop (no writer left, shutdown writes included), before rm, from the stopped container's volumes.
     stop, rm = subcommands.index("stop"), subcommands.index("rm")

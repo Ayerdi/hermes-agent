@@ -14,6 +14,11 @@ mounts them gives exactly those paths back to root before its first command. Fil
 on the host in between keep their owner. Every walk is ``find -P`` (no symlinks followed) and prunes
 each mount Docker reports nested under the sandbox paths (read-only skills, credentials, caches,
 ``docker_volumes`` and ``docker_extra_args`` binds), so host data outside the sandbox dir is never touched.
+
+Every root pass also strips setuid/setgid bits and file capabilities from sandbox files whatever
+their owner (a host-user-owned group-root setgid file runs with host egid 0): root re-chowns each
+such file to its own uid, which clears both and changes no owner. A persistent container is never
+removed, so it gets this strip-only pass when a session detaches from it and before reattaching.
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from tools.environments.base import get_sandbox_dir
 from tools.environments.remote_common import run_capture
 
 logger = logging.getLogger(__name__)
@@ -94,24 +100,42 @@ def _runs_as_root(info: dict) -> bool:
     return ((info.get("Config") or {}).get("User") or "").split(":")[0] in ("", "root", "0")
 
 
-def walk_argv(mounts: list[tuple[str, str]], mount_points: list[str], owner: int) -> list[str]:
-    """``find`` argv printing, NUL-terminated, every entry owned by *owner* under the sandbox
-    mounts. It never follows symlinks (``-P``) and prunes each mount point nested below them."""
+def _may_set_file_caps(info: dict) -> bool:
+    """Only a container granted SETFCAP (or privileged) can write file capabilities; the base
+    args drop it. ``find`` cannot test xattrs, so then every regular file is re-chowned."""
+    host = info.get("HostConfig") or {}
+    return bool(host.get("Privileged")) or any(
+        c.upper().removeprefix("CAP_") in ("SETFCAP", "ALL") for c in host.get("CapAdd") or [])
+
+
+def _sandbox_binds(info: dict) -> list[tuple[str, str]]:
+    """The Hermes sandbox binds (``<sandbox>/docker/<task>/{home,workspace}``) of a container."""
+    root = os.path.realpath(get_sandbox_dir() / "docker")
+    return [(m["Source"], m["Destination"]) for m in info.get("Mounts") or [] if m.get("Type") == "bind" and m.get(
+        "Destination") in ("/root", "/workspace") and os.path.dirname(os.path.dirname(m.get("Source", ""))) == root]
+
+
+def _owned(owner: int) -> list[str]:
+    # Device nodes and FIFOs stay root's: a host-owned block device is raw disk access.
+    return ["(", "-type", "f", "-o", "-type", "d", "-o", "-type", "l", ")", "-user", str(owner), "-print0"]
+
+
+def walk_argv(mounts: list[tuple[str, str]], mount_points: list[str], tail: list[str]) -> list[str]:
+    """``find`` argv applying *tail* to every entry under the sandbox mounts. It never follows
+    symlinks (``-P``) and prunes each mount point nested below them."""
     targets = [container for _, container in mounts]
     prune: list[str] = []
     for point in sorted({p.rstrip("/") for p in mount_points}):
         if any(point.startswith(t.rstrip("/") + "/") for t in targets):
             prune += [*(["-o"] if prune else []), "-path", re.sub(r"([][*?\\])", r"\\\1", point)]
-    return ["/usr/bin/find", "-P", *targets, "-xdev", *(["(", *prune, ")", "-prune", "-o"] if prune else []),
-            # Device nodes and FIFOs stay root's: a host-owned block device is raw disk access.
-            "(", "-type", "f", "-o", "-type", "d", "-o", "-type", "l", ")", "-user", str(owner), "-print0"]
+    return ["/usr/bin/find", "-P", *targets, "-xdev", *(["(", *prune, ")", "-prune", "-o"] if prune else []), *tail]
 
 
 def _walk(docker_exe: str, target: list[str], mounts: list[tuple[str, str]], info: dict, owner: int,
           deadline: float) -> Optional[list[bytes]]:
     """Entries owned by *owner*, or ``None`` when the walk failed (its output may be partial)."""
     points = [m["Destination"] for m in info.get("Mounts") or []]
-    result = _docker(docker_exe, target, walk_argv(mounts, points, owner), deadline)
+    result = _docker(docker_exe, target, walk_argv(mounts, points, _owned(owner)), deadline)
     if result.returncode != 0:
         logger.debug("ownership walk exited %d: %s", result.returncode,
                      result.stderr.decode("utf-8", "replace").strip()[:500])
@@ -140,23 +164,64 @@ def _chown(docker_exe: str, target: list[str], paths: list[bytes], owner: str, d
     return result.returncode == 0
 
 
-def hand_back_sandbox_files(docker_exe: str, container_id: str, mounts: list[tuple[str, str]]) -> None:
-    """After a root container has stopped (so nothing writes any more) and before it is removed:
-    give its root-owned sandbox files (``mounts`` are ``(host_dir, container_path)``) to the host
-    user from a throwaway container of the same local image with the same volumes, and record
-    which. The paths are recorded before any of them changes owner, so a timeout mid-chown still
-    leaves a complete record. Best-effort: a gone container, an image without ``find`` or a
-    timeout logs at debug."""
-    record = _record_path(mounts)
-    ids = _handback_ids(docker_exe) if record else None
+def _strip_privileges(docker_exe: str, target: list[str], mounts: list[tuple[str, str]], info: dict,
+                      deadline: float) -> None:
+    """Re-chown each setuid/setgid sandbox file (every regular file when file caps were possible)
+    to its own uid: chown clears both bits and ``security.capability`` and changes no owner, so a
+    running container's git/ssh checks are unaffected. One pass per distinct owner."""
+    points = [m["Destination"] for m in info.get("Mounts") or []]
+    select = ["-type", "f", *([] if _may_set_file_caps(info) else ["-perm", "/6000"])]
+    owners = _docker(docker_exe, target, walk_argv(mounts, points, [*select, "-exec", "/bin/stat", "-c", "%u", "--",
+                                                                  "{}", "+"]), deadline)
+    for uid in sorted({u for u in owners.stdout.decode("ascii", "replace").split() if u.isdigit()}):
+        _docker(docker_exe, target, walk_argv(mounts, points, [*select, "-user", uid, "-exec", "/bin/chown", "-h",
+                                                               "--", uid, "{}", "+"]), deadline)
+
+
+def _root_pass(docker_exe: str, container_id: str, mounts: Optional[list[tuple[str, str]]], sandbox_only: bool):
+    """``(throwaway argv, inspect record, sandbox mounts, host ids)`` for a root pass over the
+    sandbox files of *container_id*, or ``None`` when none applies. ``mounts`` ``None`` reads the
+    Hermes sandbox binds from ``docker inspect``. *sandbox_only* mounts just those dirs instead of
+    every volume: a still-running container could swap a path between walk and chown, and then
+    the swap can only lead to sandbox files (or the discarded throwaway rootfs), never host data."""
+    ids = _handback_ids(docker_exe) if mounts != [] else None
     info = _inspect(docker_exe, container_id) if ids else None
-    if not info or not _runs_as_root(info):
-        return
+    if not info or not _runs_as_root(info) or not (mounts := _sandbox_binds(info) if mounts is None else mounts):
+        return None
+    volumes = [a for src, dst in mounts for a in ("-v", f"{src}:{dst}")] if sandbox_only else [
+        "--volumes-from", container_id]
     target = ["run", "--rm", "-i", "--pull", "never", "--network", "none", "--user", "0:0", *_THROWAWAY_CONFINEMENT,
               *_SAFE_ENV, "--name", f"hermes-handback-{container_id[:12]}-{secrets.token_hex(4)}",
-              "--volumes-from", container_id, "--entrypoint", "", info["Image"]]
+              *volumes, "--entrypoint", "", info["Image"]]
+    return target, info, mounts, ids
+
+
+def strip_sandbox_privileges(docker_exe: str, container_id: str, mounts: Optional[list[tuple[str, str]]]) -> None:
+    """Strip-only pass for a persistent container that is never removed (on detach, reattach and
+    in the orphan sweep): owners stay, so its git/ssh checks keep passing. Best-effort."""
+    if (prepared := _root_pass(docker_exe, container_id, mounts, sandbox_only=True)) is None:
+        return
+    target, info, mounts, _ = prepared
+    try:
+        _strip_privileges(docker_exe, target, mounts, info, time.monotonic() + _CHOWN_TIMEOUT_S)
+    except (subprocess.TimeoutExpired, OSError, KeyError) as e:
+        logger.debug("privilege strip of %s failed: %s", container_id[:12], e)
+
+
+def hand_back_sandbox_files(docker_exe: str, container_id: str, mounts: list[tuple[str, str]]) -> None:
+    """After a root container has stopped (so nothing writes any more) and before it is removed:
+    strip setuid/setgid/file caps from its sandbox files, then give its root-owned sandbox files
+    (``mounts`` are ``(host_dir, container_path)``) to the host user from a throwaway container of
+    the same local image with the same volumes, and record which. The paths are recorded before any of them changes owner, so a timeout
+    mid-chown still leaves a complete record. Best-effort: a gone container, an image without
+    ``find`` or a timeout logs at debug."""
+    if (prepared := _root_pass(docker_exe, container_id, mounts, sandbox_only=False)) is None:
+        return
+    target, info, mounts, ids = prepared
+    record = _record_path(mounts)
     deadline = time.monotonic() + _CHOWN_TIMEOUT_S
     try:
+        _strip_privileges(docker_exe, target, mounts, info, deadline)
         paths = _walk(docker_exe, target, mounts, info, 0, deadline)
         if not paths:
             return

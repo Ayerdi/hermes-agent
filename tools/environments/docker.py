@@ -33,7 +33,8 @@ from tools.environments.docker_egress import (
     _egress_reuse_fingerprint, check_docker_env_collisions, check_extra_args_collisions,
     check_forward_env_collisions, merge_egress_env,
 )
-from tools.environments.docker_ownership import hand_back_sandbox_files, reclaim_sandbox_files
+from tools.environments.docker_ownership import (
+    hand_back_sandbox_files, reclaim_sandbox_files, strip_sandbox_privileges)
 from tools.environments.path_utils import sanitize_task_id_for_path
 from tools.environments.remote_common import (
     bash_argv, client_env_with, load_hermes_env_vars, prepend_unset, resolve_passthrough_env, run_capture)
@@ -205,6 +206,7 @@ def reap_orphan_containers(
         age = (now - finished_at).total_seconds()
         if age < max_age_seconds:
             continue
+        strip_sandbox_privileges(docker, cid, None)  # its teardown never ran; owners stay (it may restart)
         # No -f: a sibling may have restarted the container between the ps snapshot
         # and now (FinishedAt still reports the previous exit), and the daemon refuses
         # a plain rm on a running container, which is the atomic recheck this sweep needs.
@@ -752,6 +754,8 @@ class DockerEnvironment(BaseEnvironment):
             task_label, profile_name, egress_label, network)
         if not reused:
             self._container_id = self._docker_run(cwd)
+        elif self._sandbox_mounts:  # it never stopped, so no teardown stripped what it left
+            strip_sandbox_privileges(self._docker_exe, self._container_id, self._sandbox_mounts)
         reclaim_sandbox_files(self._docker_exe, self._container_id, self._sandbox_mounts)
 
         # Init-time env forwarding args seed the snapshot.
@@ -1278,16 +1282,18 @@ class DockerEnvironment(BaseEnvironment):
                 self._remove_bind_dirs()
             return
 
-        if not force_remove and self._persist_across_processes:
-            # Drop the in-process handle so a fresh __init__ re-probes via
-            # labels instead of reusing a stale Python reference.
-            self._container_id = None
-            return
-
         # Capture what the worker needs — the thread can outlive ``self``.
         docker_exe = self._docker_exe
         log_id = container_id[:12]
         sandbox_mounts = list(getattr(self, "_sandbox_mounts", []))
+
+        if not force_remove and self._persist_across_processes:
+            # Drop the in-process handle so a fresh __init__ re-probes via
+            # labels instead of reusing a stale Python reference.
+            self._container_id = None
+            if sandbox_mounts:  # the host user may run what the container left before it is reattached
+                self._start_teardown(lambda: strip_sandbox_privileges(docker_exe, container_id, sandbox_mounts), log_id)
+            return
 
         def _do_cleanup() -> None:
             for argv, fail_msg in ((["stop", "-t", "10"], "docker stop %s timed out / failed: %s"),
@@ -1301,17 +1307,21 @@ class DockerEnvironment(BaseEnvironment):
                 except (subprocess.TimeoutExpired, OSError) as e:
                     logger.warning(fail_msg, log_id, e)
 
-        t = threading.Thread(target=_do_cleanup, daemon=True, name=f"hermes-cleanup-{log_id}")
-        with _TEARDOWN_LOCK:
-            _TEARDOWN_THREADS.add(t)
-        t.start()
-        self._cleanup_thread = t
+        self._start_teardown(_do_cleanup, log_id)
         self._container_id = None
 
         # Bind-mount dirs are the container's filesystem state; only drop them
         # once the container itself is removed.
         if not self._persistent:
             self._remove_bind_dirs()
+
+    def _start_teardown(self, work, log_id: str) -> None:
+        """Run *work* on a daemon thread the atexit drain joins."""
+        t = threading.Thread(target=work, daemon=True, name=f"hermes-cleanup-{log_id}")
+        with _TEARDOWN_LOCK:
+            _TEARDOWN_THREADS.add(t)
+        t.start()
+        self._cleanup_thread = t
 
     @staticmethod
     def wait_for_all_teardowns(timeout: float = 15.0) -> bool:
