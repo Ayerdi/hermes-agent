@@ -21,7 +21,8 @@ that could write file capabilities (SETFCAP, ALL, privileged) instead gets every
 re-chowned to its own uid, which clears the bits and ``security.capability`` and changes no owner.
 A persistent container is never removed, so it gets this strip when a session detaches from it,
 before reattaching and before the stale-container sweep removes it. The strip reads the sandbox
-binds from the container itself, so a container shared across profiles gets its creator's dirs.
+binds from the container itself (a container shared across profiles has its creator's dirs) but
+only keeps those under a sandbox root this host derives from its own Hermes root.
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from hermes_constants import get_default_hermes_root
 from tools.environments.base import get_sandbox_dir
 from tools.environments.remote_common import run_capture
 
@@ -46,8 +48,6 @@ logger = logging.getLogger(__name__)
 # before any chown, so a timeout mid-chown never leaves a changed path unrecorded.
 _CHOWN_TIMEOUT_S = 10
 HANDBACK_RECORD = ".hermes-owner-handback"
-# The creating process's ``<sandbox>/docker`` root, so another profile sharing the container strips its dirs.
-SANDBOX_LABEL = "hermes-sandbox"
 # Root runs agent-writable trees: name tools by absolute path (an image without them skips the pass)
 # and reset PATH and loader env so nothing planted under /root or /workspace runs instead.
 _SAFE_ENV = ["-e", "PATH=/usr/sbin:/usr/bin:/sbin:/bin", "-e", "LD_PRELOAD=", "-e", "LD_LIBRARY_PATH=", "-w", "/"]
@@ -114,14 +114,16 @@ def _may_set_file_caps(info: dict) -> bool:
 
 
 def _sandbox_binds(info: dict) -> list[tuple[str, str]]:
-    """The container's existing Hermes sandbox binds (``<root>/<task>/{home,workspace}`` at ``/root``
-    and ``/workspace``), *root* being this process's ``<sandbox>/docker`` or the one its creator
-    labeled. Paths compare resolved, so a symlink in HERMES_HOME or TERMINAL_SANDBOX_DIR still matches."""
-    roots = {os.path.realpath(get_sandbox_dir() / "docker"),
-             os.path.realpath(((info.get("Config") or {}).get("Labels") or {}).get(SANDBOX_LABEL) or "/nonexistent")}
-    return [(m["Source"], m["Destination"]) for m in info.get("Mounts") or [] if m.get("Type") == "bind"
-            and m.get("Destination") in ("/root", "/workspace") and os.path.isdir(m.get("Source", ""))
-            and os.path.dirname(os.path.dirname(os.path.realpath(m["Source"]))) in roots]
+    """The container's Hermes sandbox binds (``<root>/<task>/{home,workspace}`` at ``/root`` and
+    ``/workspace``) as ``(realpath, destination)``. *root* is derived on this host only, never from
+    container metadata (labels and binds are settable via extra args or the image): this process's
+    ``<sandbox>/docker`` or the default one of any profile of this Hermes root (shared containers)."""
+    hermes_root = get_default_hermes_root()
+    roots = {os.path.realpath(d / "sandboxes" / "docker") for d in [hermes_root, *hermes_root.glob("profiles/*")]}
+    roots.add(os.path.realpath(get_sandbox_dir() / "docker"))
+    binds = [(os.path.realpath(m.get("Source") or "/nonexistent"), m.get("Destination")) for m in info.get("Mounts") or []
+             if m.get("Type") == "bind" and m.get("Destination") in ("/root", "/workspace")]
+    return [(src, dst) for src, dst in binds if os.path.isdir(src) and os.path.dirname(os.path.dirname(src)) in roots]
 
 
 def _owned(owner: int) -> list[str]:

@@ -111,6 +111,7 @@ def _to_root(calls):
     (False, [], _PLAIN, "persist-reap"),  # the orphan sweep, with TERMINAL_SANDBOX_DIR behind a symlink
     (False, [], _PLAIN, "persist-gone"),  # deleted sandbox dirs are never recreated root-owned
     (False, [], _PLAIN, "persist-fails-strip"),  # warned once, not at debug
+    (False, [], _PLAIN, "persist-label"),  # container metadata never widens what the root strip touches
     *[(False, args, _PLAIN, scenario) for scenario in ("handback", "persist") for args in _CAP_ARGS.values()],
 ])
 def test_root_container_teardown_hands_every_sandbox_mount_back_before_removal(
@@ -120,12 +121,18 @@ def test_root_container_teardown_hands_every_sandbox_mount_back_before_removal(
     if scenario == "persist-reap":
         (tmp_path / "link").symlink_to(real_sandbox)
     monkeypatch.setenv("TERMINAL_SANDBOX_DIR", str(tmp_path / ("link" if scenario == "persist-reap" else "sandboxes")))
+    if scenario == "persist-shared":  # profiles of one Hermes root, each with its default sandbox dir
+        monkeypatch.delenv("TERMINAL_SANDBOX_DIR")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "root" / "profiles" / "creator"))
     caps = any(a in user_args for args in _CAP_ARGS.values() for a in args[-1:])
     fail = scenario.rsplit("-", 1)[1] if "fails" in scenario else scenario if scenario == "chown-timeout" else ""
     calls = _fake_docker(monkeypatch, security_options, fail=fail)
-    nested_ro, shared = tmp_path / "skills", tmp_path / "shared"
+    nested_ro, shared, decoy = tmp_path / "skills", tmp_path / "shared", tmp_path / "outside" / "a" / "decoy"
     nested_ro.mkdir()
     shared.mkdir()
+    decoy.mkdir(parents=True)
+    if scenario == "persist-label":  # extra args (or an image LABEL) claim a host dir as a sandbox root
+        user_args = ["--label", f"hermes-sandbox={tmp_path / 'outside'}", "-v", f"{decoy}:/workspace"]
     record = tmp_path / "sandboxes" / "docker" / "chown-back" / ".hermes-owner-handback"
     if scenario.startswith("reclaim"):  # an earlier root teardown handed these back; "link" is now a symlink
         record.parent.mkdir(parents=True)
@@ -150,14 +157,14 @@ def test_root_container_teardown_hands_every_sandbox_mount_back_before_removal(
         assert all("PATH=/usr/sbin:/usr/bin:/sbin:/bin" in argv for argv, _ in calls if "/usr/bin/find" in argv), calls
         assert not record.exists()
         return
-    sandbox = env._home_dir.rsplit("/", 1)[0]
+    sandbox = os.path.realpath(env._home_dir.rsplit("/", 1)[0])  # mounted resolved: a later symlink swap is inert
     if scenario == "persist-gone":
         shutil.rmtree(sandbox)
     env.cleanup()
     assert env.wait_for_cleanup(5)
     if scenario.startswith("persist"):  # a running container: strip bits/caps in place, give nothing away
         if scenario == "persist-shared":
-            monkeypatch.setenv("TERMINAL_SANDBOX_DIR", str(tmp_path / "other-profile"))
+            monkeypatch.setenv("HERMES_HOME", str(tmp_path / "root" / "profiles" / "other"))
         monkeypatch.setattr(docker_env.DockerEnvironment, "_find_reusable_container", lambda *a: ("fake-cid", "running"))
         if scenario == "persist-gone":
             docker_env.reap_orphan_containers(max_age_seconds=0)
@@ -171,6 +178,9 @@ def test_root_container_teardown_hands_every_sandbox_mount_back_before_removal(
         strips = [argv for argv, _ in calls if "--rm" in argv and f"{sandbox}/home" in " ".join(argv)]
         assert "stop" not in [argv[1] for argv, _ in calls] and not record.exists(), calls
         assert len(strips) == {"persist-none": 0, "persist-gone": 0, "persist-reap": 3}.get(scenario, 2), calls
+        assert not [argv for argv, _ in calls if "--mount" in argv and str(decoy) in " ".join(argv)], calls
+        if scenario == "persist-label":
+            return
         for argv in strips:  # only the sandbox dirs are mounted: a swap mid-walk cannot reach host data
             _assert_strip(argv, sandbox, caps)
         warned = [r.levelno for r in caplog.records if "Could not strip" in r.getMessage() and sandbox in r.getMessage()]
